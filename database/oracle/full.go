@@ -21,6 +21,7 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/wentaojin/transferdb/common"
 	"github.com/wentaojin/transferdb/config"
+	"go.uber.org/zap"
 	"strconv"
 	"time"
 )
@@ -288,8 +289,11 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		// MAP 清空
 		rowData = make([]string, len(tableColumnNames))
 
+		zap.L().Info("oracle table rows data", zap.Int("insertBatchSize", cfg.AppConfig.InsertBatchSize), zap.Int("rowsTMP", len(rowsTMP)))
+
 		// batch 批次
 		if len(rowsTMP) == cfg.AppConfig.InsertBatchSize {
+			zap.L().Info("transfer oracle table rows data", zap.Int("insertBatchSize", cfg.AppConfig.InsertBatchSize), zap.Int("rowsTMP", len(rowsTMP)))
 
 			dataChan <- rowsTMP
 

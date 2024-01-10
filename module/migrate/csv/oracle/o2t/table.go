@@ -40,7 +40,7 @@ type Rows struct {
 	DBCharsetS   string
 	DBCharsetT   string
 	ColumnNameS  []string
-	ReadChannel chan [][]string
+	ReadChannel  chan [][]string
 	WriteChannel chan string
 }
 
@@ -144,7 +144,9 @@ func (t *Rows) ApplyData() error {
 		return err
 	}
 
-	fileW, err := os.OpenFile(t.SyncMeta.CSVFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND|os.O_TRUNC, 0666)
+	// PENWYP: 2020/7/29 临时解决方案
+
+	fileW, err := os.OpenFile(t.SyncMeta.CSVFile, os.O_WRONLY|os.O_SYNC|os.O_CREATE|os.O_APPEND|os.O_TRUNC, 0666)
 	if err != nil {
 		return err
 	}
@@ -154,16 +156,29 @@ func (t *Rows) ApplyData() error {
 	writer := bufio.NewWriterSize(fileW, 4096)
 	defer writer.Flush()
 
+	go func() {
+		zap.L().Info("csv memory monitor start")
+		for {
+			time.Sleep(time.Second)
+			writeChanSize := len(t.WriteChannel)
+			readChanSize := len(t.ReadChannel)
+			zap.L().Info("csv memory", zap.Int("writeSize", writeChanSize), zap.Int("readSize", readChanSize))
+		}
+	}()
+
 	if t.Cfg.CSVConfig.Header {
+		zap.L().Info("csv header row", zap.Int("writeSize", len(t.ColumnNameS)))
 		if _, err = writer.WriteString(common.StringsBuilder(exstrings.Join(t.ColumnNameS, t.Cfg.CSVConfig.Separator), t.Cfg.CSVConfig.Terminator)); err != nil {
 			return fmt.Errorf("failed to write headers: %v", err)
 		}
 	}
 
 	for dataC := range t.WriteChannel {
+		zap.L().Info("csv data row", zap.Int("writeSize", len(dataC)))
 		if _, err = writer.WriteString(dataC); err != nil {
 			return fmt.Errorf("failed to write data row to csv %w", err)
 		}
+		writer.Flush()
 	}
 
 	endTime := time.Now()
