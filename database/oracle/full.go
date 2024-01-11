@@ -153,7 +153,7 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		tableColumnNameIndex[v] = i
 	}
 
-	const preFetchCount = 100000
+	const preFetchCount = 10000
 	rows, err := o.OracleDB.QueryContext(o.Ctx, querySQL, godror.PrefetchCount(preFetchCount), godror.FetchArraySize(preFetchCount))
 	if err != nil {
 		return err
