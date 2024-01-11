@@ -21,6 +21,7 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/wentaojin/transferdb/common"
 	"github.com/wentaojin/transferdb/config"
+	"go.uber.org/zap"
 	"strconv"
 	"time"
 )
@@ -187,12 +188,24 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		dest[i] = &rawResult[i]
 	}
 
+	lastRowNum := 0
+	rowCount := 0
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			zap.L().Info("scan rows", zap.Int("rowCount", rowCount), zap.Int("speed", rowCount-lastRowNum))
+			lastRowNum = rowCount
+		}
+	}()
+
 	// 表行数读取
 	for rows.Next() {
 		err = rows.Scan(dest...)
 		if err != nil {
 			return err
 		}
+		rowCount++
 
 		for i, raw := range rawResult {
 			// 注意 Oracle/Mysql NULL VS 空字符串区别
