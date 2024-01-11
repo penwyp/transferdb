@@ -40,7 +40,7 @@ type Rows struct {
 	DBCharsetS   string
 	DBCharsetT   string
 	ColumnNameS  []string
-	ReadChannel chan [][]string
+	ReadChannel  chan [][]string
 	WriteChannel chan string
 }
 
@@ -116,7 +116,21 @@ func (t *Rows) ReadData() error {
 
 func (t *Rows) ProcessData() error {
 
+	lastReadCount := 0
+	readCount := 0
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			zap.L().Info("process data",
+				zap.Int("readCount", readCount),
+				zap.Int("readCountSpeed", readCount-lastReadCount))
+			lastReadCount = readCount
+		}
+	}()
+
 	for dataC := range t.ReadChannel {
+		readCount += len(dataC)
 		for _, dSlice := range dataC {
 			if len(dSlice) != len(t.ColumnNameS) {
 				return fmt.Errorf("source schema table column counts vs data counts isn't match")
@@ -160,7 +174,26 @@ func (t *Rows) ApplyData() error {
 		}
 	}
 
+	lastWriteCount := 0
+	writeCount := 0
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			zap.L().Info("apply data",
+				zap.Int("writeCount", writeCount),
+				zap.Int("writeCountSpeed", writeCount-lastWriteCount))
+			zap.L().Info("channel info",
+				zap.Int("readSize", len(t.ReadChannel)),
+				zap.Int("writeSize", len(t.WriteChannel)),
+			)
+			zap.L().Info("....................................................................................")
+			lastWriteCount = writeCount
+		}
+	}()
+
 	for dataC := range t.WriteChannel {
+		writeCount++
 		if _, err = writer.WriteString(dataC); err != nil {
 			return fmt.Errorf("failed to write data row to csv %w", err)
 		}

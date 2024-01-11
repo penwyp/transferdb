@@ -21,6 +21,8 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/wentaojin/transferdb/common"
 	"github.com/wentaojin/transferdb/config"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"strconv"
 	"time"
 )
@@ -145,9 +147,6 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		columnNames []string
 		columnTypes []string
 	)
-	// 临时数据存放
-	rowsTMP := make([][]string, 0, cfg.AppConfig.InsertBatchSize)
-	rowData := make([]string, len(tableColumnNames))
 	tableColumnNameIndex := make(map[string]int)
 	for i, v := range tableColumnNames {
 		tableColumnNameIndex[v] = i
@@ -181,133 +180,180 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 
 	// 数据 SCAN
 	columnNums := len(columnNames)
-	rawResult := make([][]byte, columnNums)
-	dest := make([]interface{}, columnNums)
-	for i := range rawResult {
-		dest[i] = &rawResult[i]
+
+	lastRowNum := 0
+	rowCount := 0
+
+	parseChannel := make(chan [][]byte, 1024)
+	defer func() {
+		close(parseChannel)
+	}()
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			zap.L().Info("scan rows", zap.Int("parseChannel", len(parseChannel)), zap.Int("rowCount", rowCount), zap.Int("speed", rowCount-lastRowNum))
+			lastRowNum = rowCount
+		}
+	}()
+
+	const parseThreadNum = 5
+	errGroup := errgroup.Group{}
+	errGroup.SetLimit(parseThreadNum)
+	for i := 0; i < parseThreadNum; i++ {
+		errGroup.Go(func() error {
+			return o.parseRowsDataToCSV(cfg, parseChannel, columnNames, columnTypes, tableColumnNameIndex, sourceDBCharset, targetDBCharset, dataChan)
+		})
 	}
 
 	// 表行数读取
 	for rows.Next() {
+		rawResult := make([][]byte, columnNums)
+		dest := make([]interface{}, columnNums)
+		for i := range rawResult {
+			dest[i] = &rawResult[i]
+		}
+
 		err = rows.Scan(dest...)
 		if err != nil {
 			return err
 		}
+		rowCount++
 
-		for i, raw := range rawResult {
-			// 注意 Oracle/Mysql NULL VS 空字符串区别
-			// Oracle 空字符串与 NULL 归于一类，统一 NULL 处理 （is null 可以查询 NULL 以及空字符串值，空字符串查询无法查询到空字符串值）
-			// Mysql 空字符串与 NULL 非一类，NULL 是 NULL，空字符串是空字符串（is null 只查询 NULL 值，空字符串查询只查询到空字符串值）
-			// 按照 Oracle 特性来，转换同步统一转换成 NULL 即可，但需要注意业务逻辑中空字符串得写入，需要变更
-			if raw == nil {
-				if cfg.CSVConfig.NullValue != "" {
-					rowData[tableColumnNameIndex[columnNames[i]]] = cfg.CSVConfig.NullValue
-				} else {
-					rowData[tableColumnNameIndex[columnNames[i]]] = `NULL`
-				}
-			} else if common.BytesToString(raw) == "" {
-				if cfg.CSVConfig.NullValue != "" {
-					rowData[tableColumnNameIndex[columnNames[i]]] = cfg.CSVConfig.NullValue
-				} else {
-					rowData[tableColumnNameIndex[columnNames[i]]] = `NULL`
-				}
-			} else {
-				switch columnTypes[i] {
-				case "int64":
-					r, err := common.StrconvIntBitSize(common.BytesToString(raw), 64)
-					if err != nil {
-						return fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
-					}
-					rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatInt(r, 10)
-				case "uint64":
-					r, err := common.StrconvUintBitSize(common.BytesToString(raw), 64)
-					if err != nil {
-						return fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
-					}
-					rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatUint(r, 10)
-				case "float32":
-					r, err := common.StrconvFloatBitSize(common.BytesToString(raw), 32)
-					if err != nil {
-						return fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
-					}
-					rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatFloat(r, 'f', -1, 32)
-				case "float64":
-					r, err := common.StrconvFloatBitSize(common.BytesToString(raw), 64)
-					if err != nil {
-						return fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
-					}
-					rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatFloat(r, 'f', -1, 64)
-				case "rune":
-					r, err := common.StrconvRune(common.BytesToString(raw))
-					if err != nil {
-						return fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
-					}
-					rowData[tableColumnNameIndex[columnNames[i]]] = string(r)
-				case "godror.Number":
-					r, err := decimal.NewFromString(common.BytesToString(raw))
-					if err != nil {
-						return fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
-					}
-					rowData[tableColumnNameIndex[columnNames[i]]] = r.String()
-				case "[]uint8":
-					// binary data -> raw、long raw、blob
-					rowData[tableColumnNameIndex[columnNames[i]]] = fmt.Sprintf("%v", raw)
-				default:
-					var convertTargetRaw []byte
-
-					convertUtf8Raw, err := common.CharsetConvert(raw, sourceDBCharset, common.CharsetUTF8MB4)
-					if err != nil {
-						return fmt.Errorf("column [%s] charset convert failed, %v", columnNames[i], err)
-					}
-
-					// 处理字符集、特殊字符转义、字符串引用定界符
-					if cfg.CSVConfig.EscapeBackslash {
-						convertTargetRaw, err = common.CharsetConvert([]byte(common.SpecialLettersUsingMySQL(convertUtf8Raw)), common.CharsetUTF8MB4, targetDBCharset)
-						if err != nil {
-							return fmt.Errorf("column [%s] charset convert failed, %v", columnNames[i], err)
-						}
-					} else {
-						convertTargetRaw, err = common.CharsetConvert(convertUtf8Raw, common.CharsetUTF8MB4, targetDBCharset)
-						if err != nil {
-							return fmt.Errorf("column [%s] charset convert failed, %v", columnNames[i], err)
-						}
-					}
-
-					if cfg.CSVConfig.Delimiter == "" {
-						rowData[tableColumnNameIndex[columnNames[i]]] = common.BytesToString(convertTargetRaw)
-					} else {
-						rowData[tableColumnNameIndex[columnNames[i]]] = common.StringsBuilder(cfg.CSVConfig.Delimiter, common.BytesToString(convertTargetRaw), cfg.CSVConfig.Delimiter)
-					}
-				}
-			}
-		}
-
-		// 临时数组
-		rowsTMP = append(rowsTMP, rowData)
-
-		// MAP 清空
-		rowData = make([]string, len(tableColumnNames))
-
-		// batch 批次
-		if len(rowsTMP) == cfg.AppConfig.InsertBatchSize {
-
-			dataChan <- rowsTMP
-
-			// 数组清空
-			rowsTMP = make([][]string, 0, cfg.AppConfig.InsertBatchSize)
-		}
+		parseChannel <- rawResult
 	}
 
 	if err = rows.Err(); err != nil {
 		return err
+	}
+	if err = errGroup.Wait(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (o *Oracle) parseRowsDataToCSV(cfg *config.Config, parseChannel chan [][]byte, columnNames []string, columnTypes []string, tableColumnNameIndex map[string]int, sourceDBCharset string, targetDBCharset string, dataChan chan [][]string) error {
+	// 临时数据存放
+	insertBatchSize := cfg.AppConfig.InsertBatchSize
+	rowsTMP := make([][]string, 0, insertBatchSize)
+
+	for rawResult := range parseChannel {
+		values, err := o.parseRawRowToStringValues(rawResult, columnNames, columnTypes, tableColumnNameIndex, cfg.CSVConfig, sourceDBCharset, targetDBCharset)
+		if err != nil {
+			return err
+		}
+		// 临时数组
+		rowsTMP = append(rowsTMP, values)
+
+		// batch 批次
+		if len(rowsTMP) == insertBatchSize {
+
+			dataChan <- rowsTMP
+
+			// 数组清空
+			rowsTMP = make([][]string, 0, insertBatchSize)
+		}
+
 	}
 
 	// 非 batch 批次
 	if len(rowsTMP) > 0 {
 		dataChan <- rowsTMP
 	}
-
 	return nil
+}
+
+func (o *Oracle) parseRawRowToStringValues(rawResult [][]byte, columnNames []string, columnTypes []string, tableColumnNameIndex map[string]int, csvConfig config.CSVConfig, sourceDBCharset, targetDBCharset string) ([]string, error) {
+	rowData := make([]string, len(columnNames))
+	for i, raw := range rawResult {
+		// 注意 Oracle/Mysql NULL VS 空字符串区别
+		// Oracle 空字符串与 NULL 归于一类，统一 NULL 处理 （is null 可以查询 NULL 以及空字符串值，空字符串查询无法查询到空字符串值）
+		// Mysql 空字符串与 NULL 非一类，NULL 是 NULL，空字符串是空字符串（is null 只查询 NULL 值，空字符串查询只查询到空字符串值）
+		// 按照 Oracle 特性来，转换同步统一转换成 NULL 即可，但需要注意业务逻辑中空字符串得写入，需要变更
+		if raw == nil {
+			if csvConfig.NullValue != "" {
+				rowData[tableColumnNameIndex[columnNames[i]]] = csvConfig.NullValue
+			} else {
+				rowData[tableColumnNameIndex[columnNames[i]]] = `NULL`
+			}
+		} else if common.BytesToString(raw) == "" {
+			if csvConfig.NullValue != "" {
+				rowData[tableColumnNameIndex[columnNames[i]]] = csvConfig.NullValue
+			} else {
+				rowData[tableColumnNameIndex[columnNames[i]]] = `NULL`
+			}
+		} else {
+			switch columnTypes[i] {
+			case "int64":
+				r, err := common.StrconvIntBitSize(common.BytesToString(raw), 64)
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
+				}
+				rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatInt(r, 10)
+			case "uint64":
+				r, err := common.StrconvUintBitSize(common.BytesToString(raw), 64)
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
+				}
+				rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatUint(r, 10)
+			case "float32":
+				r, err := common.StrconvFloatBitSize(common.BytesToString(raw), 32)
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
+				}
+				rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatFloat(r, 'f', -1, 32)
+			case "float64":
+				r, err := common.StrconvFloatBitSize(common.BytesToString(raw), 64)
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
+				}
+				rowData[tableColumnNameIndex[columnNames[i]]] = strconv.FormatFloat(r, 'f', -1, 64)
+			case "rune":
+				r, err := common.StrconvRune(common.BytesToString(raw))
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
+				}
+				rowData[tableColumnNameIndex[columnNames[i]]] = string(r)
+			case "godror.Number":
+				r, err := decimal.NewFromString(common.BytesToString(raw))
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] strconv failed, %v", columnNames[i], err)
+				}
+				rowData[tableColumnNameIndex[columnNames[i]]] = r.String()
+			case "[]uint8":
+				// binary data -> raw、long raw、blob
+				rowData[tableColumnNameIndex[columnNames[i]]] = fmt.Sprintf("%v", raw)
+			default:
+				var convertTargetRaw []byte
+
+				convertUtf8Raw, err := common.CharsetConvert(raw, sourceDBCharset, common.CharsetUTF8MB4)
+				if err != nil {
+					return nil, fmt.Errorf("column [%s] charset convert failed, %v", columnNames[i], err)
+				}
+
+				// 处理字符集、特殊字符转义、字符串引用定界符
+				if csvConfig.EscapeBackslash {
+					convertTargetRaw, err = common.CharsetConvert([]byte(common.SpecialLettersUsingMySQL(convertUtf8Raw)), common.CharsetUTF8MB4, targetDBCharset)
+					if err != nil {
+						return nil, fmt.Errorf("column [%s] charset convert failed, %v", columnNames[i], err)
+					}
+				} else {
+					convertTargetRaw, err = common.CharsetConvert(convertUtf8Raw, common.CharsetUTF8MB4, targetDBCharset)
+					if err != nil {
+						return nil, fmt.Errorf("column [%s] charset convert failed, %v", columnNames[i], err)
+					}
+				}
+
+				if csvConfig.Delimiter == "" {
+					rowData[tableColumnNameIndex[columnNames[i]]] = common.BytesToString(convertTargetRaw)
+				} else {
+					rowData[tableColumnNameIndex[columnNames[i]]] = common.StringsBuilder(csvConfig.Delimiter, common.BytesToString(convertTargetRaw), csvConfig.Delimiter)
+				}
+			}
+		}
+	}
+	return rowData, nil
+
 }
 
 // 获取表字段名以及行数据 -> 用于 FULL/ALL
