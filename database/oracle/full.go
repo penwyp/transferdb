@@ -18,6 +18,7 @@ package oracle
 import (
 	"context"
 	"fmt"
+	"github.com/godror/godror"
 	"github.com/shopspring/decimal"
 	"github.com/wentaojin/transferdb/common"
 	"github.com/wentaojin/transferdb/config"
@@ -152,7 +153,8 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		tableColumnNameIndex[v] = i
 	}
 
-	rows, err := o.OracleDB.QueryContext(o.Ctx, querySQL)
+	const preFetchCount = 100000
+	rows, err := o.OracleDB.QueryContext(o.Ctx, querySQL, godror.PrefetchCount(preFetchCount), godror.FetchArraySize(preFetchCount))
 	if err != nil {
 		return err
 	}
@@ -185,9 +187,6 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 	rowCount := 0
 
 	parseChannel := make(chan [][]byte, 1024)
-	defer func() {
-		close(parseChannel)
-	}()
 
 	go func() {
 		for {
@@ -197,7 +196,7 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		}
 	}()
 
-	const parseThreadNum = 5
+	const parseThreadNum = 100
 	errGroup := errgroup.Group{}
 	errGroup.SetLimit(parseThreadNum)
 	for i := 0; i < parseThreadNum; i++ {
@@ -216,16 +215,18 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 
 		err = rows.Scan(dest...)
 		if err != nil {
+			close(parseChannel)
 			return err
 		}
 		rowCount++
-
 		parseChannel <- rawResult
 	}
 
 	if err = rows.Err(); err != nil {
+		close(parseChannel)
 		return err
 	}
+	close(parseChannel)
 	if err = errGroup.Wait(); err != nil {
 		return err
 	}

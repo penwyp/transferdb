@@ -165,7 +165,7 @@ func (t *Rows) ApplyData() error {
 	defer fileW.Close()
 
 	// 使用 bufio 来缓存写入文件，以提高效率
-	writer := bufio.NewWriterSize(fileW, 4096)
+	writer := bufio.NewWriterSize(fileW, 4096*1024)
 	defer writer.Flush()
 
 	if t.Cfg.CSVConfig.Header {
