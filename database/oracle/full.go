@@ -187,6 +187,13 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 		dest[i] = &rawResult[i]
 	}
 
+	opt := &csvOption{
+		nullValue:      cfg.CSVConfig.NullValue,
+		separator:      []byte(cfg.CSVConfig.Separator),
+		delimiter:      []byte(cfg.CSVConfig.Delimiter),
+		lineTerminator: []byte(cfg.CSVConfig.Terminator),
+	}
+
 	// 表行数读取
 	for rows.Next() {
 		err = rows.Scan(dest...)
@@ -251,7 +258,10 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 					rowData[tableColumnNameIndex[columnNames[i]]] = r.String()
 				case "[]uint8":
 					// binary data -> raw、long raw、blob
-					rowData[tableColumnNameIndex[columnNames[i]]] = fmt.Sprintf("%v", raw)
+					csvStr := escapeBackslashCSV(raw, opt)
+					//oracleJpgBytesStrLen := len(oracleJpgBytesStr)
+
+					rowData[tableColumnNameIndex[columnNames[i]]] = csvStr
 				default:
 					var convertTargetRaw []byte
 
@@ -506,4 +516,52 @@ func (o *Oracle) GetOracleTableRowsData(querySQL string, insertBatchSize, callTi
 	}
 
 	return nil
+}
+
+type csvOption struct {
+	nullValue      string
+	separator      []byte
+	delimiter      []byte
+	lineTerminator []byte
+}
+
+func escapeBackslashCSV(s []byte, opt *csvOption) string {
+	bs := ""
+
+	var (
+		escape  byte
+		last         = 0
+		specCmt byte = 0
+	)
+	if len(opt.delimiter) > 0 {
+		specCmt = opt.delimiter[0] // if csv has a delimiter, we should use backslash to comment the delimiter in field value
+	} else if len(opt.separator) > 0 {
+		specCmt = opt.separator[0] // if csv's delimiter is "", we should escape the separator to avoid error
+	}
+
+	for i := 0; i < len(s); i++ {
+		escape = 0
+
+		switch s[i] {
+		case 0: /* Must be escaped for 'mysql' */
+			escape = '0'
+		case '\r':
+			escape = 'r'
+		case '\n': /* escaped for line terminators */
+			escape = 'n'
+		case '\\':
+			escape = '\\'
+		case specCmt:
+			escape = specCmt
+		}
+
+		if escape != 0 {
+			bs += string(s[last:i])
+			bs += string('\\')
+			bs += string(escape)
+			last = i + 1
+		}
+	}
+	bs += string(s[last:])
+	return bs
 }
