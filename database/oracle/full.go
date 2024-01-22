@@ -16,6 +16,7 @@ limitations under the License.
 package oracle
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/shopspring/decimal"
@@ -188,10 +189,11 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 	}
 
 	opt := &csvOption{
-		nullValue:      cfg.CSVConfig.NullValue,
-		separator:      []byte(cfg.CSVConfig.Separator),
-		delimiter:      []byte(cfg.CSVConfig.Delimiter),
-		lineTerminator: []byte(cfg.CSVConfig.Terminator),
+		escapeBackslash: cfg.CSVConfig.EscapeBackslash,
+		nullValue:       cfg.CSVConfig.NullValue,
+		separator:       []byte(cfg.CSVConfig.Separator),
+		delimiter:       []byte(cfg.CSVConfig.Delimiter),
+		lineTerminator:  []byte(cfg.CSVConfig.Terminator),
 	}
 
 	// 表行数读取
@@ -258,10 +260,7 @@ func (o *Oracle) GetOracleTableRowsDataCSV(querySQL, sourceDBCharset, targetDBCh
 					rowData[tableColumnNameIndex[columnNames[i]]] = r.String()
 				case "[]uint8":
 					// binary data -> raw、long raw、blob
-					csvStr := escapeBackslashCSV(raw, opt)
-					//oracleJpgBytesStrLen := len(oracleJpgBytesStr)
-
-					rowData[tableColumnNameIndex[columnNames[i]]] = csvStr
+					rowData[tableColumnNameIndex[columnNames[i]]] = escapeCSV(raw, opt)
 				default:
 					var convertTargetRaw []byte
 
@@ -519,14 +518,26 @@ func (o *Oracle) GetOracleTableRowsData(querySQL string, insertBatchSize, callTi
 }
 
 type csvOption struct {
-	nullValue      string
-	separator      []byte
-	delimiter      []byte
-	lineTerminator []byte
+	escapeBackslash bool
+	nullValue       string
+	separator       []byte
+	delimiter       []byte
+	lineTerminator  []byte
+}
+
+func escapeCSV(s []byte, opt *csvOption) string {
+	switch {
+	case opt.escapeBackslash:
+		return escapeBackslashCSV(s, opt)
+	case len(opt.delimiter) > 0:
+		return string(bytes.ReplaceAll(s, opt.delimiter, append(opt.delimiter, opt.delimiter...)))
+	default:
+		return string(s)
+	}
 }
 
 func escapeBackslashCSV(s []byte, opt *csvOption) string {
-	bs := ""
+	bf := bytes.Buffer{}
 
 	var (
 		escape  byte
@@ -556,12 +567,12 @@ func escapeBackslashCSV(s []byte, opt *csvOption) string {
 		}
 
 		if escape != 0 {
-			bs += string(s[last:i])
-			bs += string('\\')
-			bs += string(escape)
+			bf.Write(s[last:i])
+			bf.WriteByte('\\')
+			bf.WriteByte(escape)
 			last = i + 1
 		}
 	}
-	bs += string(s[last:])
-	return bs
+	bf.Write(s[last:])
+	return bf.String()
 }
